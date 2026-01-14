@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.env
+.venv/
+
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.h5
+large_files/
+
+# Results and output directories
+results/
+**/output/
+**/outputs/
+attacks/*/results/
+attacks/FOA-Attack/resources/images/bigscale/
+attacks/Attack-Bard/attack_img_encoder_misdescription/
