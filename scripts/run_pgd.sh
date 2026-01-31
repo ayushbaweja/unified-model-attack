@@ -39,25 +39,37 @@ DEFAULT_MODEL_PATH="$MODELS_DIR/Bagel/models/BAGEL-7B-MoT/ae.safetensors"
 # Parse arguments
 INPUT_DIR="${1:-$DEFAULT_INPUT_DIR}"
 OUTPUT_DIR="${2:-$DEFAULT_OUTPUT_DIR}"
-EPSILON="${3:-0.03}"
+EPSILON="${3:-0.06}"
 ALPHA="${4:-0.01}"
 ITERATIONS="${5:-40}"
+ANALYZE="${6:-true}"
+
+# Build analyze flag
+ANALYZE_FLAG=""
+if [ "$ANALYZE" = "true" ] || [ "$ANALYZE" = "1" ] || [ "$ANALYZE" = "yes" ]; then
+    ANALYZE_FLAG="--analyze"
+fi
 
 print_info "PGD Attack on Bagel VAE"
 print_info "======================="
 print_info ""
 print_info "Input images directory: $INPUT_DIR"
-print_info "Output directory: $OUTPUT_DIR"
+print_info "Output directory: $OUTPUT_DIR/eps_$EPSILON"
 print_info "Model path: $DEFAULT_MODEL_PATH"
 print_info "Epsilon: $EPSILON"
 print_info "Alpha: $ALPHA"
 print_info "Iterations: $ITERATIONS"
+if [ -n "$ANALYZE_FLAG" ]; then
+    print_info "VAE analysis: enabled"
+else
+    print_info "VAE analysis: disabled"
+fi
 print_info ""
 
 # Check if input directory exists
 if [ ! -d "$INPUT_DIR" ]; then
     print_error "Input directory does not exist: $INPUT_DIR"
-    print_info "Usage: $0 [input_dir] [output_dir] [epsilon] [alpha] [iterations]"
+    print_info "Usage: $0 [input_dir] [output_dir] [epsilon] [alpha] [iterations] [analyze]"
     exit 1
 fi
 
@@ -126,7 +138,8 @@ EOFPYTHON
         --model_path "$DEFAULT_MODEL_PATH" \
         --epsilon "$EPSILON" \
         --alpha "$ALPHA" \
-        --iter "$ITERATIONS"
+        --iter "$ITERATIONS" \
+        $ANALYZE_FLAG
 
     EXIT_CODE=$?
     rm -f "$TEMP_SCRIPT"
@@ -138,7 +151,8 @@ else
         --model_path "$DEFAULT_MODEL_PATH" \
         --epsilon "$EPSILON" \
         --alpha "$ALPHA" \
-        --iter "$ITERATIONS"
+        --iter "$ITERATIONS" \
+        $ANALYZE_FLAG
 
     EXIT_CODE=$?
 fi
@@ -146,7 +160,7 @@ fi
 if [ $EXIT_CODE -eq 0 ]; then
     print_success "PGD Attack completed successfully!"
     print_info ""
-    print_info "Results saved to: $OUTPUT_DIR"
+    print_info "Results saved to: $OUTPUT_DIR/eps_$EPSILON"
 else
     print_error "PGD Attack failed with exit code $EXIT_CODE"
     exit $EXIT_CODE

@@ -1,9 +1,10 @@
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 import numpy as np
 import argparse
 import os
+import json
 from pathlib import Path
 from tqdm import tqdm
 from dataclasses import dataclass
@@ -311,7 +312,156 @@ def pgd_attack_vae(
 
     return (images + delta).detach()
 
+def tensor_to_pil(tensor):
+    """Convert a [-1,1] normalised tensor (B,C,H,W) or (C,H,W) to a PIL Image."""
+    img = (tensor * 0.5 + 0.5).clamp(0, 1)
+    if img.dim() == 4:
+        img = img[0]
+    img = img.permute(1, 2, 0).cpu().numpy()
+    return Image.fromarray((img * 255).astype(np.uint8))
+
+
+@torch.no_grad()
+def analyze_vae_resilience(model, original, adversarial, device):
+    """Measure how effectively the adversarial perturbation survives VAE
+    encode-decode and compute latent-sensitivity metrics.
+
+    Returns
+    -------
+    metrics : dict all scalar diagnostics
+    recon_orig : Tensor VAE(original)
+    recon_adv  : Tensor VAE(adversarial)
+    """
+    original = original.to(device)
+    adversarial = adversarial.to(device)
+
+    # --- Latent representations (deterministic: use mean only) ----------
+    # Use the encoder directly and take the mean (first half of channels)
+    # to avoid stochastic sampling noise in the analysis.
+    enc_orig = model.encoder(original)
+    enc_adv  = model.encoder(adversarial)
+    mean_orig, _ = torch.chunk(enc_orig, 2, dim=1)
+    mean_adv,  _ = torch.chunk(enc_adv,  2, dim=1)
+    z_orig = model.scale_factor * (mean_orig - model.shift_factor)
+    z_adv  = model.scale_factor * (mean_adv  - model.shift_factor)
+
+    # Reconstructions
+    recon_orig = model.decode(z_orig)
+    recon_adv  = model.decode(z_adv)
+
+    # Pixel-space perturbation
+    pixel_diff  = adversarial - original
+    pixel_l2    = pixel_diff.norm(p=2).item()
+    pixel_linf  = pixel_diff.abs().max().item()
+    pixel_mse   = F.mse_loss(adversarial, original).item()
+    n_pixels    = float(pixel_diff.numel())
+
+    # --- Latent-space perturbation
+    latent_diff  = z_adv - z_orig
+    latent_l2    = latent_diff.norm(p=2).item()
+    latent_linf  = latent_diff.abs().max().item()
+    latent_mse   = F.mse_loss(z_adv, z_orig).item()
+    latent_cos   = F.cosine_similarity(
+        z_orig.flatten().unsqueeze(0),
+        z_adv.flatten().unsqueeze(0),
+    ).item()
+
+    # Latent sensitivity (ratio of latent change to pixel change) 
+    sensitivity_l2   = latent_l2   / (pixel_l2   + 1e-8)
+    sensitivity_linf = latent_linf / (pixel_linf + 1e-8)
+
+    # Compression resilience
+    recon_diff      = recon_adv - recon_orig
+    recon_diff_l2   = recon_diff.norm(p=2).item()
+    recon_diff_mse  = F.mse_loss(recon_adv, recon_orig).item()
+    recon_diff_linf = recon_diff.abs().max().item()
+
+    # Filtering ratio: (reconstruction change) / (pixel perturbation)
+    filtering_ratio_l2   = recon_diff_l2   / (pixel_l2   + 1e-8)
+    filtering_ratio_linf = recon_diff_linf / (pixel_linf + 1e-8)
+
+    # Reconstruction quality (how well does the VAE reconstruct each?)
+    orig_recon_mse = F.mse_loss(recon_orig, original).item()
+    adv_recon_mse  = F.mse_loss(recon_adv,  adversarial).item()
+
+    metrics = {
+        # Pixel perturbation
+        "pixel_l2":              round(pixel_l2, 6),
+        "pixel_linf":            round(pixel_linf, 6),
+        "pixel_mse":             round(pixel_mse, 6),
+        # Latent perturbation
+        "latent_l2":             round(latent_l2, 6),
+        "latent_linf":           round(latent_linf, 6),
+        "latent_mse":            round(latent_mse, 6),
+        "latent_cosine_sim":     round(latent_cos, 6),
+        # Sensitivity (latent change / pixel change)
+        "sensitivity_l2":        round(sensitivity_l2, 6),
+        "sensitivity_linf":      round(sensitivity_linf, 6),
+        # Compression resilience
+        "recon_diff_l2":         round(recon_diff_l2, 6),
+        "recon_diff_mse":        round(recon_diff_mse, 6),
+        "recon_diff_linf":       round(recon_diff_linf, 6),
+        "filtering_ratio_l2":    round(filtering_ratio_l2, 6),
+        "filtering_ratio_linf":  round(filtering_ratio_linf, 6),
+        # Reconstruction quality
+        "orig_recon_mse":        round(orig_recon_mse, 6),
+        "adv_recon_mse":         round(adv_recon_mse, 6),
+    }
+
+    return metrics, recon_orig, recon_adv
+
+
+def save_comparison_grid(original, adversarial, recon_orig, recon_adv, save_path):
+    """Save a 2×3 comparison grid:
+
+    Row 1: Original | Adversarial | |Perturbation| × 10
+    Row 2: VAE(Original) | VAE(Adversarial) | |Recon Diff| × 10
+    """
+    pil_orig    = tensor_to_pil(original)
+    pil_adv     = tensor_to_pil(adversarial)
+    pil_recon_o = tensor_to_pil(recon_orig)
+    pil_recon_a = tensor_to_pil(recon_adv)
+
+    # Amplified perturbation map
+    perturb = (adversarial - original).abs() * 10
+    if perturb.dim() == 4:
+        perturb = perturb[0]
+    pil_perturb = Image.fromarray(
+        (perturb.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    )
+
+    # Amplified reconstruction-difference map
+    rdiff = (recon_adv - recon_orig).abs() * 10
+    if rdiff.dim() == 4:
+        rdiff = rdiff[0]
+    pil_rdiff = Image.fromarray(
+        (rdiff.clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    )
+
+    w, h = pil_orig.size
+    label_h = 20
+    labels_top    = ["Original", "Adversarial", "Perturbation (10x)"]
+    labels_bottom = ["VAE(Original)", "VAE(Adversarial)", "Recon Diff (10x)"]
+    images_top    = [pil_orig, pil_adv, pil_perturb]
+    images_bottom = [pil_recon_o, pil_recon_a, pil_rdiff]
+
+    grid = Image.new("RGB", (w * 3, (h + label_h) * 2), color=(255, 255, 255))
+    draw = ImageDraw.Draw(grid)
+
+    for col, (img, label) in enumerate(zip(images_top, labels_top)):
+        grid.paste(img, (col * w, label_h))
+        draw.text((col * w + 4, 2), label, fill=(0, 0, 0))
+
+    for col, (img, label) in enumerate(zip(images_bottom, labels_bottom)):
+        grid.paste(img, (col * w, h + label_h * 2))
+        draw.text((col * w + 4, h + label_h + 2), label, fill=(0, 0, 0))
+
+    grid.save(save_path)
+
+
 def process_batch(args, model, transform, image_files, device):
+    all_metrics = []
+
     for img_path in tqdm(image_files, desc="Attacking images"):
         try:
             pil_img = Image.open(img_path).convert("RGB")
@@ -329,14 +479,86 @@ def process_batch(args, model, transform, image_files, device):
             num_iter=args.iter,
             device=device
         )
-        
-        save_name = img_path.stem + f"_eps{args.epsilon}_adv.png"
+
+        stem = img_path.stem
+        tag  = f"_eps{args.epsilon}"
+
+        save_name = f"{stem}{tag}_adv.png"
         save_path = Path(args.output_dir) / save_name
-        
         adv_img_np = (adv_tensor * 0.5 + 0.5).clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy()
         adv_img_np = (adv_img_np * 255).astype(np.uint8)[0]
-        
         Image.fromarray(adv_img_np).save(save_path)
+
+        if args.analyze:
+            metrics, recon_orig, recon_adv = analyze_vae_resilience(
+                model, img_tensor, adv_tensor, device
+            )
+            metrics["image"] = img_path.name
+
+            decoded_path = Path(args.output_dir) / f"{stem}{tag}_vae_decoded.png"
+            tensor_to_pil(recon_adv).save(decoded_path)
+
+            recon_orig_path = Path(args.output_dir) / f"{stem}{tag}_vae_orig.png"
+            tensor_to_pil(recon_orig).save(recon_orig_path)
+
+            grid_path = Path(args.output_dir) / f"{stem}{tag}_comparison.png"
+            save_comparison_grid(
+                img_tensor, adv_tensor, recon_orig, recon_adv, grid_path
+            )
+
+            all_metrics.append(metrics)
+
+            print(f"\n{'='*60}")
+            print(f"  {img_path.name}")
+            print(f"{'='*60}")
+            print(f"  Pixel perturbation   L2={metrics['pixel_l2']:.4f}  "
+                  f"Linf={metrics['pixel_linf']:.4f}  "
+                  f"MSE={metrics['pixel_mse']:.6f}")
+            print(f"  Latent perturbation  L2={metrics['latent_l2']:.4f}  "
+                  f"Linf={metrics['latent_linf']:.4f}  "
+                  f"MSE={metrics['latent_mse']:.6f}  "
+                  f"cos={metrics['latent_cosine_sim']:.4f}")
+            print(f"  Sensitivity          L2={metrics['sensitivity_l2']:.4f}  "
+                  f"Linf={metrics['sensitivity_linf']:.4f}")
+            print(f"  Filtering ratio      L2={metrics['filtering_ratio_l2']:.4f}  "
+                  f"Linf={metrics['filtering_ratio_linf']:.4f}")
+            print(f"  Recon quality        orig_MSE={metrics['orig_recon_mse']:.6f}  "
+                  f"adv_MSE={metrics['adv_recon_mse']:.6f}")
+            if metrics['filtering_ratio_l2'] < 0.5:
+                print(f"  >> VAE strongly filters the perturbation")
+            elif metrics['filtering_ratio_l2'] < 1.0:
+                print(f"  >> VAE partially filters the perturbation")
+            else:
+                print(f"  >> Perturbation survives (or is amplified by) the VAE")
+
+    if args.analyze and all_metrics:
+        summary_path = Path(args.output_dir) / "vae_analysis_summary.json"
+        keys = [k for k in all_metrics[0] if k != "image"]
+        avg = {k: round(np.mean([m[k] for m in all_metrics]), 6) for k in keys}
+        summary = {
+            "epsilon": args.epsilon,
+            "alpha": args.alpha,
+            "iterations": args.iter,
+            "num_images": len(all_metrics),
+            "per_image": all_metrics,
+            "average": avg,
+        }
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+
+        print(f"\n{'='*60}")
+        print(f"  AGGREGATE  ({len(all_metrics)} images)")
+        print(f"{'='*60}")
+        print(f"  Avg pixel perturbation   L2={avg['pixel_l2']:.4f}  "
+              f"Linf={avg['pixel_linf']:.4f}")
+        print(f"  Avg latent perturbation  L2={avg['latent_l2']:.4f}  "
+              f"Linf={avg['latent_linf']:.4f}")
+        print(f"  Avg sensitivity          L2={avg['sensitivity_l2']:.4f}  "
+              f"Linf={avg['sensitivity_linf']:.4f}")
+        print(f"  Avg filtering ratio      L2={avg['filtering_ratio_l2']:.4f}  "
+              f"Linf={avg['filtering_ratio_linf']:.4f}")
+        print(f"  Avg latent cosine sim    {avg['latent_cosine_sim']:.4f}")
+        print(f"\n  Summary saved to {summary_path}")
 
 def main():
     parser = argparse.ArgumentParser(description="PGD Attack on Bagel VAE")
@@ -345,12 +567,15 @@ def main():
     default_model = "/ssdscratch/abaweja7/unified-model-attack/models/Bagel/models/BAGEL-7B-MoT/ae.safetensors"
 
     parser.add_argument("--input_dir", type=str, default=default_input, help="Path to directory containing images")
-    parser.add_argument("--output_dir", type=str, default="results", help="Directory to save adversarial images")
+    parser.add_argument("--output_dir", type=str, default="results/pgd", help="Base directory to save adversarial images (eps subfolder added automatically)")
     parser.add_argument("--model_path", type=str, default=default_model, help="Path to model checkpoint")
     
-    parser.add_argument("--epsilon", type=float, default=0.03, help="Perturbation magnitude")
+    parser.add_argument("--epsilon", type=float, default=0.06, help="Perturbation magnitude")
     parser.add_argument("--alpha", type=float, default=0.01, help="Step size")
     parser.add_argument("--iter", type=int, default=40, help="Number of PGD iterations")
+    parser.add_argument("--analyze", action="store_true",
+                        help="Run VAE resilience analysis: save decoded outputs, "
+                             "comparison grids, and latent sensitivity metrics")
     
     args = parser.parse_args()
 
@@ -363,8 +588,9 @@ def main():
     ae.eval()
 
     input_path = Path(args.input_dir)
-    output_path = Path(args.output_dir)
+    output_path = Path(args.output_dir) / f"eps_{args.epsilon}"
     output_path.mkdir(parents=True, exist_ok=True)
+    args.output_dir = str(output_path)
     
     image_files = list(input_path.glob("*.jpg")) + list(input_path.glob("*.png")) + list(input_path.glob("*.jpeg")) + list(input_path.glob("*.JPEG")) + list(input_path.glob("*.JPG"))
     
