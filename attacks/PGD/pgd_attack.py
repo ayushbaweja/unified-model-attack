@@ -288,7 +288,6 @@ def pgd_attack_vae(
     model.eval()
     images = images.to(device)
     
-    # 1. Random Start
     delta = torch.zeros_like(images).uniform_(-epsilon, epsilon)
     delta = torch.clamp(images + delta, -1, 1) - images
     delta.requires_grad = True
@@ -296,13 +295,9 @@ def pgd_attack_vae(
     for i in range(num_iter):
         adv_images = images + delta
         
-        # 2. Forward
         reconstructions = model(adv_images)
-        
-        # 3. Maximize MSE
         loss = F.mse_loss(reconstructions, images, reduction='sum')
         
-        # 4. Update
         grad = torch.autograd.grad(loss, delta)[0]
         with torch.no_grad():
             delta = delta + alpha * grad.sign()
@@ -311,6 +306,74 @@ def pgd_attack_vae(
             delta.requires_grad = True # Reset for next iter
 
     return (images + delta).detach()
+
+
+def pgd_attack_latent(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    epsilon: float,
+    alpha: float,
+    num_iter: int,
+    device: str,
+    latent_mode: str = "mean",
+    var_weight: float = 1.0
+) -> torch.Tensor:
+    """PGD attack that maximises distance in VAE latent space (before Gaussian sampling).
+
+    Args:
+        latent_mode: Attack objective variant
+            - "mean": maximize ||μ_orig - μ_adv||  (shift mean away from clean)
+            - "mean_var": maximize ||μ_orig - μ_adv|| + λ||std_adv||  (shift mean + increase variance)
+            - "mean_neg_var": maximize ||μ_orig - μ_adv|| - λ||std_adv||  (shift mean + decrease variance)
+        var_weight: Weight λ for the variance term (default 1.0)
+    """
+    model.eval()
+    images = images.to(device)
+
+    # Encode original (get μ and logvar BEFORE Gaussian sampling)
+    with torch.no_grad():
+        enc_orig = model.encoder(images)
+        mu_orig, logvar_orig = torch.chunk(enc_orig, 2, dim=1)
+        # Apply scale/shift to get the actual latent scale
+        mu_orig_scaled = model.scale_factor * (mu_orig - model.shift_factor)
+
+    delta = torch.zeros_like(images).uniform_(-epsilon, epsilon)
+    delta = torch.clamp(images + delta, -1, 1) - images
+    delta.requires_grad = True
+
+    for i in range(num_iter):
+        adv_images = images + delta
+
+        enc_adv = model.encoder(adv_images)
+        mu_adv, logvar_adv = torch.chunk(enc_adv, 2, dim=1)
+        mu_adv_scaled = model.scale_factor * (mu_adv - model.shift_factor)
+        std_adv = torch.exp(0.5 * logvar_adv)
+
+        mean_loss = F.mse_loss(mu_adv_scaled, mu_orig_scaled, reduction='sum')
+
+        if latent_mode == "mean":
+            # Just maximize ||μ_orig - μ_adv||
+            loss = mean_loss
+        elif latent_mode == "mean_var":
+            # Maximize ||μ_orig - μ_adv|| + λ||std_adv||  (shift mean + INCREASE variance)
+            var_loss = std_adv.pow(2).sum()
+            loss = mean_loss + var_weight * var_loss
+        elif latent_mode == "mean_neg_var":
+            # Maximize ||μ_orig - μ_adv|| - λ||std_adv||  (shift mean + DECREASE variance)
+            var_loss = std_adv.pow(2).sum()
+            loss = mean_loss - var_weight * var_loss
+        else:
+            raise ValueError(f"Unknown latent_mode: {latent_mode}")
+
+        grad = torch.autograd.grad(loss, delta)[0]
+        with torch.no_grad():
+            delta = delta + alpha * grad.sign()
+            delta = torch.clamp(delta, -epsilon, epsilon)
+            delta = torch.clamp(images + delta, -1, 1) - images
+            delta.requires_grad = True
+
+    return (images + delta).detach()
+
 
 def tensor_to_pil(tensor):
     """Convert a [-1,1] normalised tensor (B,C,H,W) or (C,H,W) to a PIL Image."""
@@ -335,13 +398,16 @@ def analyze_vae_resilience(model, original, adversarial, device):
     original = original.to(device)
     adversarial = adversarial.to(device)
 
-    # --- Latent representations (deterministic: use mean only) ----------
-    # Use the encoder directly and take the mean (first half of channels)
-    # to avoid stochastic sampling noise in the analysis.
+    # Latent representations
     enc_orig = model.encoder(original)
     enc_adv  = model.encoder(adversarial)
-    mean_orig, _ = torch.chunk(enc_orig, 2, dim=1)
-    mean_adv,  _ = torch.chunk(enc_adv,  2, dim=1)
+    mean_orig, logvar_orig = torch.chunk(enc_orig, 2, dim=1)
+    mean_adv, logvar_adv   = torch.chunk(enc_adv,  2, dim=1)
+
+    # Standard deviations
+    std_orig = torch.exp(0.5 * logvar_orig)
+    std_adv  = torch.exp(0.5 * logvar_adv)
+
     z_orig = model.scale_factor * (mean_orig - model.shift_factor)
     z_adv  = model.scale_factor * (mean_adv  - model.shift_factor)
 
@@ -356,7 +422,7 @@ def analyze_vae_resilience(model, original, adversarial, device):
     pixel_mse   = F.mse_loss(adversarial, original).item()
     n_pixels    = float(pixel_diff.numel())
 
-    # --- Latent-space perturbation
+    # Latent-space perturbation
     latent_diff  = z_adv - z_orig
     latent_l2    = latent_diff.norm(p=2).item()
     latent_linf  = latent_diff.abs().max().item()
@@ -384,16 +450,31 @@ def analyze_vae_resilience(model, original, adversarial, device):
     orig_recon_mse = F.mse_loss(recon_orig, original).item()
     adv_recon_mse  = F.mse_loss(recon_adv,  adversarial).item()
 
+    # Variance (std) metrics
+    std_orig_mean = std_orig.mean().item()
+    std_adv_mean  = std_adv.mean().item()
+    std_orig_l2   = std_orig.norm(p=2).item()
+    std_adv_l2    = std_adv.norm(p=2).item()
+    std_change    = (std_adv - std_orig).mean().item()  # positive = variance increased
+    std_ratio     = std_adv_mean / (std_orig_mean + 1e-8)  # >1 means variance increased
+
     metrics = {
         # Pixel perturbation
         "pixel_l2":              round(pixel_l2, 6),
         "pixel_linf":            round(pixel_linf, 6),
         "pixel_mse":             round(pixel_mse, 6),
-        # Latent perturbation
+        # Latent mean perturbation
         "latent_l2":             round(latent_l2, 6),
         "latent_linf":           round(latent_linf, 6),
         "latent_mse":            round(latent_mse, 6),
         "latent_cosine_sim":     round(latent_cos, 6),
+        # Latent variance (std) metrics
+        "std_orig_mean":         round(std_orig_mean, 6),
+        "std_adv_mean":          round(std_adv_mean, 6),
+        "std_orig_l2":           round(std_orig_l2, 6),
+        "std_adv_l2":            round(std_adv_l2, 6),
+        "std_change":            round(std_change, 6),
+        "std_ratio":             round(std_ratio, 6),
         # Sensitivity (latent change / pixel change)
         "sensitivity_l2":        round(sensitivity_l2, 6),
         "sensitivity_linf":      round(sensitivity_linf, 6),
@@ -471,14 +552,26 @@ def process_batch(args, model, transform, image_files, device):
 
         img_tensor = transform(pil_img).unsqueeze(0).to(device)
 
-        adv_tensor = pgd_attack_vae(
-            model=model,
-            images=img_tensor,
-            epsilon=args.epsilon,
-            alpha=args.alpha,
-            num_iter=args.iter,
-            device=device
-        )
+        if args.loss == "latent":
+            adv_tensor = pgd_attack_latent(
+                model=model,
+                images=img_tensor,
+                epsilon=args.epsilon,
+                alpha=args.alpha,
+                num_iter=args.iter,
+                device=device,
+                latent_mode=args.latent_mode,
+                var_weight=args.var_weight
+            )
+        else:
+            adv_tensor = pgd_attack_vae(
+                model=model,
+                images=img_tensor,
+                epsilon=args.epsilon,
+                alpha=args.alpha,
+                num_iter=args.iter,
+                device=device
+            )
 
         stem = img_path.stem
         tag  = f"_eps{args.epsilon}"
@@ -514,10 +607,14 @@ def process_batch(args, model, transform, image_files, device):
             print(f"  Pixel perturbation   L2={metrics['pixel_l2']:.4f}  "
                   f"Linf={metrics['pixel_linf']:.4f}  "
                   f"MSE={metrics['pixel_mse']:.6f}")
-            print(f"  Latent perturbation  L2={metrics['latent_l2']:.4f}  "
+            print(f"  Latent μ perturbation  L2={metrics['latent_l2']:.4f}  "
                   f"Linf={metrics['latent_linf']:.4f}  "
                   f"MSE={metrics['latent_mse']:.6f}  "
                   f"cos={metrics['latent_cosine_sim']:.4f}")
+            print(f"  Latent std (σ)       orig={metrics['std_orig_mean']:.4f}  "
+                  f"adv={metrics['std_adv_mean']:.4f}  "
+                  f"change={metrics['std_change']:+.4f}  "
+                  f"ratio={metrics['std_ratio']:.4f}")
             print(f"  Sensitivity          L2={metrics['sensitivity_l2']:.4f}  "
                   f"Linf={metrics['sensitivity_linf']:.4f}")
             print(f"  Filtering ratio      L2={metrics['filtering_ratio_l2']:.4f}  "
@@ -536,6 +633,9 @@ def process_batch(args, model, transform, image_files, device):
         keys = [k for k in all_metrics[0] if k != "image"]
         avg = {k: round(np.mean([m[k] for m in all_metrics]), 6) for k in keys}
         summary = {
+            "loss": args.loss,
+            "latent_mode": args.latent_mode if args.loss == "latent" else None,
+            "var_weight": args.var_weight if args.loss == "latent" else None,
             "epsilon": args.epsilon,
             "alpha": args.alpha,
             "iterations": args.iter,
@@ -551,8 +651,12 @@ def process_batch(args, model, transform, image_files, device):
         print(f"{'='*60}")
         print(f"  Avg pixel perturbation   L2={avg['pixel_l2']:.4f}  "
               f"Linf={avg['pixel_linf']:.4f}")
-        print(f"  Avg latent perturbation  L2={avg['latent_l2']:.4f}  "
+        print(f"  Avg latent μ perturbation  L2={avg['latent_l2']:.4f}  "
               f"Linf={avg['latent_linf']:.4f}")
+        print(f"  Avg latent std (σ)       orig={avg['std_orig_mean']:.4f}  "
+              f"adv={avg['std_adv_mean']:.4f}  "
+              f"change={avg['std_change']:+.4f}  "
+              f"ratio={avg['std_ratio']:.4f}")
         print(f"  Avg sensitivity          L2={avg['sensitivity_l2']:.4f}  "
               f"Linf={avg['sensitivity_linf']:.4f}")
         print(f"  Avg filtering ratio      L2={avg['filtering_ratio_l2']:.4f}  "
@@ -573,6 +677,17 @@ def main():
     parser.add_argument("--epsilon", type=float, default=0.06, help="Perturbation magnitude")
     parser.add_argument("--alpha", type=float, default=0.01, help="Step size")
     parser.add_argument("--iter", type=int, default=40, help="Number of PGD iterations")
+    parser.add_argument("--loss", type=str, default="pixel", choices=["pixel", "latent"],
+                        help="Loss space: 'pixel' = MSE on full VAE reconstruction (default), "
+                             "'latent' = MSE on encoder latents only")
+    parser.add_argument("--latent_mode", type=str, default="mean",
+                        choices=["mean", "mean_var", "mean_neg_var"],
+                        help="Latent attack objective (only used when --loss=latent): "
+                             "'mean' = max ||μ_orig - μ_adv|| (default), "
+                             "'mean_var' = max ||μ_orig - μ_adv|| + λ||std|| (shift mean + increase variance), "
+                             "'mean_neg_var' = max ||μ_orig - μ_adv|| - λ||std|| (shift mean + decrease variance)")
+    parser.add_argument("--var_weight", type=float, default=1.0,
+                        help="Weight λ for variance term in latent attack (default: 1.0)")
     parser.add_argument("--analyze", action="store_true",
                         help="Run VAE resilience analysis: save decoded outputs, "
                              "comparison grids, and latent sensitivity metrics")
@@ -588,7 +703,10 @@ def main():
     ae.eval()
 
     input_path = Path(args.input_dir)
-    output_path = Path(args.output_dir) / f"eps_{args.epsilon}"
+    if args.loss == "latent":
+        output_path = Path(args.output_dir) / f"eps_{args.epsilon}_{args.loss}_{args.latent_mode}"
+    else:
+        output_path = Path(args.output_dir) / f"eps_{args.epsilon}_{args.loss}"
     output_path.mkdir(parents=True, exist_ok=True)
     args.output_dir = str(output_path)
     

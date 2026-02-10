@@ -43,6 +43,9 @@ EPSILON="${3:-0.06}"
 ALPHA="${4:-0.01}"
 ITERATIONS="${5:-40}"
 ANALYZE="${6:-true}"
+LOSS="${7:-pixel}"
+LATENT_MODE="${8:-mean}"
+VAR_WEIGHT="${9:-1.0}"
 
 # Build analyze flag
 ANALYZE_FLAG=""
@@ -50,15 +53,27 @@ if [ "$ANALYZE" = "true" ] || [ "$ANALYZE" = "1" ] || [ "$ANALYZE" = "yes" ]; th
     ANALYZE_FLAG="--analyze"
 fi
 
+# Determine output subdirectory name
+if [ "$LOSS" = "latent" ]; then
+    OUTPUT_SUBDIR="eps_${EPSILON}_${LOSS}_${LATENT_MODE}"
+else
+    OUTPUT_SUBDIR="eps_${EPSILON}_${LOSS}"
+fi
+
 print_info "PGD Attack on Bagel VAE"
 print_info "======================="
 print_info ""
 print_info "Input images directory: $INPUT_DIR"
-print_info "Output directory: $OUTPUT_DIR/eps_$EPSILON"
+print_info "Output directory: $OUTPUT_DIR/$OUTPUT_SUBDIR"
 print_info "Model path: $DEFAULT_MODEL_PATH"
 print_info "Epsilon: $EPSILON"
 print_info "Alpha: $ALPHA"
 print_info "Iterations: $ITERATIONS"
+print_info "Loss space: $LOSS"
+if [ "$LOSS" = "latent" ]; then
+    print_info "Latent mode: $LATENT_MODE"
+    print_info "Var weight: $VAR_WEIGHT"
+fi
 if [ -n "$ANALYZE_FLAG" ]; then
     print_info "VAE analysis: enabled"
 else
@@ -69,7 +84,18 @@ print_info ""
 # Check if input directory exists
 if [ ! -d "$INPUT_DIR" ]; then
     print_error "Input directory does not exist: $INPUT_DIR"
-    print_info "Usage: $0 [input_dir] [output_dir] [epsilon] [alpha] [iterations] [analyze]"
+    print_info "Usage: $0 [input_dir] [output_dir] [epsilon] [alpha] [iterations] [analyze] [loss] [latent_mode] [var_weight]"
+    print_info ""
+    print_info "Arguments:"
+    print_info "  input_dir    - Directory containing input images (default: resources/test-images)"
+    print_info "  output_dir   - Base output directory (default: results/pgd)"
+    print_info "  epsilon      - L-inf perturbation budget (default: 0.06)"
+    print_info "  alpha        - PGD step size (default: 0.01)"
+    print_info "  iterations   - Number of PGD iterations (default: 40)"
+    print_info "  analyze      - Run VAE analysis: true/false (default: true)"
+    print_info "  loss         - Loss space: pixel/latent (default: pixel)"
+    print_info "  latent_mode  - Latent attack mode: mean/mean_var/mean_neg_var (default: mean, only for loss=latent)"
+    print_info "  var_weight   - Weight for variance term (default: 1.0, only for loss=latent)"
     exit 1
 fi
 
@@ -132,6 +158,12 @@ sys.argv = ['pgd_attack.py'] + sys.argv[2:]
 main()
 EOFPYTHON
 
+    # Build latent mode flags
+    LATENT_FLAGS=""
+    if [ "$LOSS" = "latent" ]; then
+        LATENT_FLAGS="--latent_mode $LATENT_MODE --var_weight $VAR_WEIGHT"
+    fi
+
     uv run --python 3.10 "$TEMP_SCRIPT" "$PGD_DIR" \
         --input_dir "$INPUT_DIR" \
         --output_dir "$OUTPUT_DIR" \
@@ -139,12 +171,21 @@ EOFPYTHON
         --epsilon "$EPSILON" \
         --alpha "$ALPHA" \
         --iter "$ITERATIONS" \
+        --loss "$LOSS" \
+        $LATENT_FLAGS \
         $ANALYZE_FLAG
 
     EXIT_CODE=$?
     rm -f "$TEMP_SCRIPT"
 else
     print_info "Running with system Python..."
+
+    # Build latent mode flags
+    LATENT_FLAGS=""
+    if [ "$LOSS" = "latent" ]; then
+        LATENT_FLAGS="--latent_mode $LATENT_MODE --var_weight $VAR_WEIGHT"
+    fi
+
     python pgd_attack.py \
         --input_dir "$INPUT_DIR" \
         --output_dir "$OUTPUT_DIR" \
@@ -152,6 +193,8 @@ else
         --epsilon "$EPSILON" \
         --alpha "$ALPHA" \
         --iter "$ITERATIONS" \
+        --loss "$LOSS" \
+        $LATENT_FLAGS \
         $ANALYZE_FLAG
 
     EXIT_CODE=$?
@@ -160,7 +203,7 @@ fi
 if [ $EXIT_CODE -eq 0 ]; then
     print_success "PGD Attack completed successfully!"
     print_info ""
-    print_info "Results saved to: $OUTPUT_DIR/eps_$EPSILON"
+    print_info "Results saved to: $OUTPUT_DIR/$OUTPUT_SUBDIR"
 else
     print_error "PGD Attack failed with exit code $EXIT_CODE"
     exit $EXIT_CODE
